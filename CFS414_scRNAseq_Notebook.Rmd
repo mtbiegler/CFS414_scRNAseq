@@ -1,0 +1,785 @@
+---
+title: "CFS414 sc-RNAseq"
+output: html_notebook
+---
+ OBJECT GENERATION
+
+Loading Seurat objects
+```{r Seurat object load}
+library(Seurat)
+library(sctransform)
+
+library(cowplot) 
+
+library(dplyr)
+library(knitr)
+library(plotly)
+library(clustree)
+library(DropletUtils)
+theme_set(theme_cowplot())
+
+library(future)
+plan()
+plan("multisession", workers = 7)
+plan()
+
+
+```
+
+Load 10x data - available 
+```{r}
+cfs24.raw<-readRDS("/Raw_CFS414/cfs24_MT_cellCyle_rawSeurat.RData")
+cfs50.raw<-readRDS("/Raw_CFS414/cfs50_MT_cellCyle_rawSeurat.RData")
+```
+
+
+Apply passage and identify sequence character pre-integration
+```{r}
+cfs24<-cfs24.raw
+cfs50<-cfs50.raw
+cfs24$passage<-"P24"
+cfs50$passage<-"P50"
+cfs24$all<-"CFS414"
+cfs50$all<-"CFS414"
+
+#Identify mitochondrial gene percentage to indicate dying cells
+cfs24[["percent.mt"]] <- PercentageFeatureSet(cfs24, pattern = "^MT-")
+cfs50[["percent.mt"]] <- PercentageFeatureSet(cfs50, pattern = "^MT-")
+
+#Identify cell outliers for sample trimming
+VlnPlot(cfs50, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), 
+        ncol = 3)+ylim(0,25)
+
+VlnPlot(cfs24, features = c("nFeature_RNA", "nCount_RNA","percent.mt"), 
+        ncol = 3)+ylim(0,25)
+```
+
+Trim samples for low quality cells and outliers
+```{r}
+cfs24 <- subset(cfs24, subset = nCount_RNA > 10000 & nCount_RNA < 75000 & 
+                  nFeature_RNA > 3000 & percent.mt<5)
+cfs50 <- subset(cfs50, subset = nCount_RNA > 10000 & nCount_RNA < 75000 & 
+                  nFeature_RNA > 3000 & percent.mt<5)
+```
+
+Normalize and scale data with regression for integration
+```{r}
+cfs24 <- NormalizeData(cfs24)
+cfs50 <- NormalizeData(cfs50)
+
+# cell cycle genes for regression through Seurat
+s_genes <- cc.genes.updated.2019$s.genes
+g2m_genes <- cc.genes.updated.2019$g2m.genes
+
+#Get cell cycle scores
+cfs24 <- CellCycleScoring(cfs24, g2m.features = g2m_genes, 
+                          s.features = s_genes)
+cfs50 <- CellCycleScoring(cfs50, g2m.features = g2m_genes, 
+                          s.features = s_genes)
+
+#Initial normalization to identify Phase for each cell barcode
+cfs24_cc <- SCTransform(cfs24,
+                        vars.to.regress = c("S.Score", "G2M.Score",
+                                            "percent.mt"),verbose=FALSE)
+cfs50_cc <- SCTransform(cfs50,
+                        vars.to.regress = c("S.Score", "G2M.Score",
+                                                  "percent.mt"),verbose=FALSE)   
+
+# Find additional zebra finch genes that are strongly differential 
+# by cell cycle for regression
+Idents(cfs24_cc)<-cfs24$Phase
+Idents(cfs50_cc)<-cfs50$Phase
+
+cfs24_CC_expanded <- FindAllMarkers(cfs24_cc, only.pos=TRUE, min.pct = 0.4, 
+                                    logfc.threshold = 0.250, min.diff.pct = .2, 
+                                    return.thresh = 0.00005)
+
+cfs50_CC_expanded <- FindAllMarkers(cfs50_cc, only.pos=TRUE, min.pct = 0.4, 
+                                    logfc.threshold = 0.250, min.diff.pct = .2, 
+                                    return.thresh = 0.00005)
+
+combined_cc<-intersect(rownames(cfs24_CC_expanded),rownames(cfs50_CC_expanded))
+
+#Re-score with the Phase markers from the first regression
+cfs24$CellCycleExpanded<-PercentageFeatureSet(cfs24,features = combined_cc)
+cfs50$CellCycleExpanded<-PercentageFeatureSet(cfs50,features = combined_cc)
+
+#Second normalization/scale to prevent
+cfs24 <- SCTransform(cfs24,
+                     vars.to.regress = c("S.Score", "G2M.Score",
+                                         "CellCycleExpanded","percent.mt"),
+                     verbose=FALSE)
+
+cfs50 <- SCTransform(cfs50,
+                     vars.to.regress = c("S.Score", "G2M.Score",
+                                         "CellCycleExpanded","percent.mt"),
+                     verbose=FALSE)   
+
+integration.list<-c(cfs24,cfs50)
+
+rm(cfs24_cc,cfs50_cc,cfs24.raw,cfs50.raw)
+```
+
+Integrate CFS24 and CFS50 with SCTransform
+```{r}
+#Expand memory allocation for local analysis
+options(future.globals.maxSize = 16000 * 1024^2)
+
+ integration.features <- SelectIntegrationFeatures(object.list = integration.list)
+ 
+ integration.list <- PrepSCTIntegration(object.list = integration.list, 
+                                        anchor.features = 
+                                          integration.features, 
+                                        verbose = FALSE)
+ 
+ integration.anchors <- FindIntegrationAnchors(object.list = integration.list, 
+                                               normalization.method = "SCT", 
+                                               anchor.features = 
+                                                 integration.features, 
+                                               verbose = FALSE)
+
+CFS414_integrated <- IntegrateData(anchorset = integration.anchors, 
+                                   normalization.method = "SCT", 
+                                   verbose = FALSE)
+
+CFS414_integrated <- RunPCA(CFS414_integrated, verbose = FALSE,dims=1:200)
+
+rm(integration.list,integration.anchors,integration.features)
+```
+
+
+Determine how many dimensions to use for UMAP and Clustering, from:
+https://hbctraining.github.io/scRNA-seq/lessons/elbow_plot_metric.html
+```{r}
+elbow<-ElbowPlot(CFS414_integrated,ndims = 50)
+elbow
+
+percent_var <- CFS414_integrated[["pca"]]@stdev/
+  sum(CFS414_integrated[["pca"]]@stdev) * 100
+
+# Calculate cumulative percents for each PC
+cumulative_percent <- cumsum(percent_var)
+
+# Threshold 1: cumulative percent of PCs is greater than 90% and 
+# current PC is less than 5% of total
+var1<- which(cumulative_percent > 90 & percent_var < 5)[1]
+
+# Threshold 2: % of variation is more than 0.1% from 1 PC to the next
+var2 <- sort(which((percent_var[1:length(percent_var) - 1] - 
+                      percent_var[2:length(percent_var)]) > 0.1), 
+             decreasing = T)[1] + 1
+
+#Take minimum threshold
+PCs <- min(var1, var2)
+PCs
+
+# Elbow plot to visualize
+plot_df <- data.frame(pct = percent_var, 
+           cumu = cumulative_percent, 
+           rank = 1:length(percent_var)) 
+
+# Modified Elbow Plot to highlight the thresholds and identify point
+ggplot(plot_df, aes(cumulative_percent, percent_var, label = rank, 
+                    color = rank > PCs)) + geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(percent_var[percent_var > 5]), 
+             color = "grey") + theme_bw()
+  
+  rm(cumulative_percent,var1,var2,elbow,percent_var)
+```
+
+Assess cluster formation, based on:
+https://cran.r-project.org/web/packages/clustree/vignettes/clustree.html#seurat-objects
+```{r}
+DefaultAssay(CFS414)<-"integrated"
+#Generate a number of cluster parameters for clustree
+CFS414 <- FindClusters(CFS414, verbose = FALSE, 
+                    resolution = c(0.050, 0.100, 0.150, 0.200, 
+                                   0.250, 0.300, 0.350, 0.400,
+                                   0.450, 0.500, 0.550, 0.600,
+                                   0.650, 0.700, 0.750, 0.800,
+                                   0.850, 0.900, 0.950, 1.000), 
+                    save.SNN=TRUE)
+
+
+clustree(CFS414, prefix = "integrated_snn_res.",
+         show_axis=TRUE,
+         node_colour = "sc3_stability", verbose=FALSE)
+```
+
+```{r}
+CFS414_tree<-CFS414
+CFS414_tree$res.0.05<-CFS414_tree$integrated_snn_res.0.05
+CFS414_tree$res.0.1<-CFS414_tree$integrated_snn_res.0.1
+CFS414_tree$res.0.2<-CFS414_tree$integrated_snn_res.0.2
+CFS414_tree$res.0.3<-CFS414_tree$integrated_snn_res.0.3
+CFS414_tree$res.0.4<-CFS414_tree$integrated_snn_res.0.4
+CFS414_tree$res.0.5<-CFS414_tree$integrated_snn_res.0.5
+CFS414_tree$res.0.75<-CFS414_tree$integrated_snn_res.0.75
+CFS414_tree$res.1.0<-CFS414_tree$integrated_snn_res.1
+
+tree<-clustree(CFS414_tree, prefix = "res.",
+         show_axis=TRUE,
+         node_colour = "sc3_stability", verbose=FALSE)
+```
+
+
+
+UMAP Plot of varying resolutions
+```{r}
+p1<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.05",label=T)
+p2<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.1", label=T)
+p3<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.15",label=T)
+p4<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.2", label=T)
+p5<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.25",label=T)
+p6<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.3", label=T)
+p7<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.35",label=T)
+p8<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.4", label=T)
+p9<- UMAPPlot(CFS414,group.by="integrated_snn_res.0.45",label=T)
+p10<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.5", label=T)
+p11<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.55",label=T)
+p12<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.6", label=T)
+p13<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.65",label=T)
+p14<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.7", label=T)
+p15<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.75",label=T)
+p16<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.8", label=T)
+p17<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.85",label=T)
+p18<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.9", label=T)
+p19<-UMAPPlot(CFS414,group.by="integrated_snn_res.0.95",label=T)
+p20<-UMAPPlot(CFS414,group.by="integrated_snn_res.1",   label=T)
+
+p1+p2+p3+p4+p5+p6+p7+p8+p9+p10+p11+p12+p13+p14+p15+p16+p17+p18+p19+p20
+rm(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,p16,p17,p18,p19,p20)
+
+```
+
+----
+FIGURE GENERATION
+
+
+
+Figure 3a based on: 
+https://satijalab.org/seurat/archive/v2.4/immune_alignment.html
+```{r}
+DefaultAssay(CFS414_integrated) <- "RNA" #Raw RNA read values
+
+AvgGeneExpr <- CFS414_integrated
+
+#Group the cells by passage for average expression differences
+Idents(AvgGeneExpr) <- "passage"
+
+#Computes average expression, as natural log + 1
+AvgGeneExpr <- log1p(AverageExpression(AvgGeneExpr, verbose=TRUE)$RNA) 
+
+#Add these expression values to the object
+AvgGeneExpr$gene <- rownames(AvgGeneExpr) 
+
+#Color genes with logfc >.25 and expressed in over 10% of cells
+ChangeMarkers<-FindMarkers(CFS414_integrated,group.by="passage",
+                           ident.1 = "P50", ident.2 = "P24",
+                           logfc.threshold = 0.25, min.pct=.10) 
+
+#Find genes to label (LogFC>1)
+BigChangeMarkers<-FindMarkers(CFS414_integrated,group.by="passage",
+                              ident.1 = "P50", ident.2 = "P24",
+                              logfc.threshold = 1,min.pct= .10)
+
+#Label genes with logfc >1
+genes.to.label<-rownames(BigChangeMarkers) 
+
+AvgExprPlot <- ggplot(AvgGeneExpr, aes(`P50`, `P24`,name=gene)) + 
+  geom_point(color='darkgray',alpha=0.3) + ggtitle("Passage differences") + 
+  geom_abline(intercept = 0, slope = 1, color="blue", size=0.5,alpha=0.8) + 
+  geom_point(data=AvgGeneExpr[rownames(ChangeMarkers),], 
+             aes(x=`P50`,y=`P24`),color='red',alpha=0.3)
+
+AvgExprPlot <- LabelPoints(plot = AvgExprPlot, 
+                           points = genes.to.label, repel = T)
+
+length(rownames(ChangeMarkers))
+length(genes.to.label)
+
+AvgExprPlot + ylim(0,5) + xlim(0,5)
+
+rm(AvgGeneExpr, AvgExprPlot)
+```
+
+Figure 3b
+```{r}
+DefaultAssay(CFS414)<-"RNA"
+
+# Get most variable genes across all cell types in passage 24
+VG_P24 <- FindVariableFeatures(subset(CFS414,subset=passage=="P24"), 
+                               selection.method = "vst", nfeatures = 500, 
+                               verbose=F,mean.cutoff = c(-Inf,Inf),
+                               dispersion.cutoff = c(-Inf,Inf))
+
+VG_P24<-VariableFeaturePlot(VG_P24)
+
+# Get most variable genes across all cell types in passage 50
+VG_P50 <- FindVariableFeatures(subset(CFS414,subset=passage=="P50"), 
+                               selection.method = "vst", nfeatures = 500, 
+                               verbose=F,mean.cutoff = c(-Inf,Inf),
+                               dispersion.cutoff = c(-Inf,Inf))
+
+VG_P50<-VariableFeaturePlot(VG_P50)
+
+
+VG_P24+NoLegend()+ylim(0,50)
+
+VG_P50+NoLegend()+ylim(0,50)
+```
+
+Figure 3c
+```{r}
+
+UMAP_P24 <- UMAPPlot(subset(CFS414,subset=passage=="P24"),
+                     group.by="integrated_snn_res.0.3",label=FALSE) +
+  ylim(-6,6)+xlim(-6,6) +
+  theme(plot.title = element_blank()) # +NoLegend()
+
+UMAP_P50 <- UMAPPlot(subset(CFS414,subset=passage=="P50"),
+                     group.by="integrated_snn_res.0.3",label=FALSE) +
+  ylim(-6,6)+xlim(-6,6) +
+  theme(plot.title = element_blank()) # +NoLegend()
+
+UMAPP24 + UMAP_P50
+rm(UMAP_P24,UMAP_P50)
+
+```
+
+Figure 3d
+```{r}
+
+Figure_3D<-UMAPPlot(CFS414,label=F, group.by="passage", order=F, 
+                    cols=alpha(c("pink","skyblue"),0.6)) + 
+  ylim(-6,6) + xlim(-6,6) + NoLegend()
+
+Figure_3D
+
+rm(CFS414_integrated)
+```
+
+Figure 3e
+```{r}
+DefaultAssay(CFS414)<-"RNA"
+
+Figure_3E_P24<-FeaturePlot(subset(CFS414, subset=passage=="P24"),
+                           features="TNNT2", order=T, max.cutoff = 2.5) + 
+  ylim(-6,6) + xlim(-6,6) + theme(plot.title = element_blank()) + NoLegend() + 
+  guides(color = guide_colorbar(draw.ulim=F,draw.llim=F))
+
+Figure_3E_P50<-FeaturePlot(subset(CFS414, subset=passage=="P50"),
+                           features="TNNT2", order=T, max.cutoff = 2.5) + 
+  ylim(-6,6) + xlim(-6,6) + theme(plot.title = element_blank()) + NoLegend() + 
+  guides(color = guide_colorbar(draw.ulim=F,draw.llim=F))
+
+Figure_3E_P24+Figure_3E_P50
+```
+
+Figure 4A
+```{r}
+Idents(CFS414)<-CFS414$integrated_snn_res.0.3
+DefaultAssay(CFS414)<-"RNA"
+
+#Genes associated with myocytes
+genesA<-c("MYOG","MEF2C","TNNT2","ACTC1")
+
+Figure_4A<-VlnPlot(CFS414,features=genesA, split.by = "passage", 
+                   split.plot = T, ncol = 4, pt.size = 0.01,
+                   cols=alpha(c("pink","skyblue"),0.9))
+
+Figure_4A
+
+rm(genesA)
+```
+
+Figure 4B
+```{r}
+Idents(CFS414)<-CFS414$integrated_snn_res.0.3
+DefaultAssay(CFS414)<-"RNA"
+
+#Genes broadly associated with muscle cells
+genesB<-c("MYOD1","SIX1","SIX4","MET","NOTCH2")
+
+Figure_4B<-VlnPlot(CFS414,features=genesB, split.by = "passage",
+                   split.plot = T, ncol = 5, pt.size = 0.01,
+                   cols=alpha(c("pink","skyblue"),0.9))
+
+Figure_4B
+rm(genesB) 
+```
+
+Figure 4C
+```{r}
+
+#From https://pubmed.ncbi.nlm.nih.gov/30210552/
+FitzMSC_genes<-read.csv("~/Reference_Files/Fitzsimmons_MSC_Markers.csv")
+DefaultAssay(CFS414)<-"RNA"
+
+Fig4CDot<-DotPlot(subset(CFS414,subset=passage=="P24"), 
+                  features= FitzMSC_genes$Gene, scale.by='radius',
+                  scale.max = 100)
+
+
+Fig4CDot$plot_env$avg.exp.scaled<-Fig4CDot$data$avg.exp
+Fig4CDot$data$avg.exp.scaled<-Fig4CDot$data$avg.exp
+Fig4CDot$data$avg.exp.scaled<-MinMax(Fig4CDot$data$avg.exp.scaled, 
+                                     min = 0, max = 3)
+
+Fig4CDot + theme(axis.text.x=element_text(angle=60,hjust=1)) + 
+  guides(color = guide_colorbar(nbins=20,draw.ulim=FALSE,draw.llim=FALSE))
+
+rm(FitzMSC_genes)
+```
+
+Figure 4d
+```{r}
+DefaultAssay(CFS414)<-"RNA"
+
+genesD<-c("LOC100228280","TERT","KLF4",
+          "MYC","SOX2","LOC100227862")
+genesD_names<-c('Pou5f3','TERT','KLF4',
+                'MYC','SOX2','NANOG') #Rename LOC ID to gene name, NANOG
+
+Fig4DDot<-DotPlot(subset(CFS414,subset=passage=="P24"), 
+                  features=genesD, scale.by='radius',scale.max = 100)
+Fig4DDot$data$features.plot<-factor(c(genesD_names),
+                                    levels=c('MYC','KLF4','Pou5f3',
+                                             'SOX2','NANOG','TERT'))
+Fig4DDot$data$avg.exp.scaled<-Fig4DDot$data$avg.exp
+Fig4DDot$data$avg.exp.scaled<-MinMax(Fig4DDot$data$avg.exp.scaled, 
+                                     min = 0, max = 1)
+
+Fig4DDot+theme(axis.text.x=element_text(angle=60,hjust=1)) + 
+  guides(color = guide_colorbar(draw.ulim=FALSE,draw.llim=FALSE))
+
+rm(genesD,genesD_names)
+```
+
+
+Figures 5b, 6d-f
+```{r}
+DefaultAssay(CFS414)<-"RNA"
+
+UMAP_SAP30L<-FeaturePlot(CFS414,features="SAP30L",order=T, ncol=1, 
+                         max.cutoff=1.5,cols=c("white","purple")) + 
+  ylim(-6,6)+xlim(-6,6) + 
+  guides(color = guide_colorbar(draw.ulim=FALSE,draw.llim=FALSE)) + 
+  theme(plot.title = element_blank()) + NoLegend()
+
+UMAP_ZEB2<-FeaturePlot(CFS414,features="ZEB2",order=T, ncol=1, 
+                       max.cutoff=1.5,cols=c("white","purple")) + 
+  ylim(-6,6)+xlim(-6,6) + 
+  guides(color = guide_colorbar(draw.ulim=FALSE,draw.llim=FALSE)) + 
+  theme(plot.title = element_blank()) + NoLegend()
+
+UMAP_HTR1A<-FeaturePlot(CFS414,features="HTR1A",order=T, ncol=1, 
+                        max.cutoff=0.25,pt.size = 1.25,cols=c("white","red")) + 
+  ylim(-6,6)+xlim(-6,6) + 
+  guides(color = guide_colorbar(draw.ulim=FALSE,draw.llim=FALSE)) + 
+  theme(plot.title = element_blank()) + NoLegend()
+
+UMAP_PVALB<-FeaturePlot(CFS414,features="PVALB",order=T, ncol=1, 
+                        max.cutoff=0.25,pt.size = 1.25,cols=c("white","red")) + 
+  ylim(-6,6)+xlim(-6,6) + 
+  guides(color = guide_colorbar(draw.ulim=FALSE,draw.llim=FALSE)) + 
+  theme(plot.title = element_blank()) + NoLegend()
+
+```
+
+----
+
+Supplementary Figure 4b, c
+```{r}
+#Generate histograms of read and gene counts for each trimmed, barcoded cell
+p1<-hist(subset(CFS414, subset = passage == "P24")$nFeature_RNA, 
+         ylim = c(0,2000),xlim = c(0,10000),
+         main="P24 Feature Counts",xlab="Genes/Cell")
+p2<-hist(subset(CFS414, subset = passage == "P50")$nFeature_RNA, 
+         ylim = c(0,2000),xlim = c(0,10000),
+         main="P50 Feature Counts",xlab="Genes/Cell")
+
+p3<-hist(subset(CFS414, subset = passage == "P24")$nCount_RNA, 
+         ylim = c(0,2000),xlim = c(0,100000),
+         main="P24 Read Counts",xlab="Reads/Cell")
+p4<-hist(subset(CFS414, subset = passage == "P50")$nCount_RNA, 
+         ylim = c(0,2000),xlim = c(0,100000),
+         main="P50 Read Counts",xlab="Reads/Cell")
+
+p1+p2+p3+p4
+
+rm(p1,p2,p3,p4)
+```
+
+Supplementary Figure 4e
+```{r}
+# Generate a hierarchical tree of cluster splitting by 'resolution' 
+# and colored by S.Phase
+
+clustree(CFS414_tree, prefix = "res.",
+         show_axis=TRUE,node_colour = "S.Score",
+         node_colour_aggr="median", verbose=FALSE)
+```
+
+Cluster Tree identification (Fig. 4f,g)
+```{r}
+Idents(CFS414)<-CFS414$integrated_snn_res.0.3
+
+UMAPPlot(CFS414)
+CFS414<-BuildClusterTree(object=CFS414, assay='RNA', 
+                         slot = "data", dims=1:13)
+
+PlotClusterTree(CFS414)
+```
+
+Supplementary Figure 4f, g
+```{r}
+
+#basic plot of clusters by replicate
+
+CFS414$clusters<-CFS414$integrated_snn_res.0.3
+
+my_levels <- c(2,3,1,0,4)
+factor(CFS414@meta.data$clusters, levels= my_levels)
+CFS414@meta.data$clusters <- factor(CFS414@meta.data$clusters, 
+                                    levels= my_levels)
+
+p1<-ggplot(CFS414@meta.data, aes(x=clusters, fill=passage)) + 
+  geom_bar(position="fill") + xlab("Identity") + ylab("Proportion") + 
+  scale_y_continuous(breaks=seq(0,1,.10))
+
+p2<-ggplot(CFS414@meta.data, aes(x=clusters, fill=Phase)) + 
+  geom_bar(position="fill") + xlab("Identity") + ylab("Proportion") + 
+  scale_y_continuous(breaks=seq(0,1,.10))
+
+p1+p2
+
+rm(p1,p2)
+```
+
+Supplementary Figure 4g.2
+```{r}
+
+p3<-ggplot(CFS414@meta.data, aes(x=passage, fill=Phase)) + 
+  geom_bar(position="fill") + xlab("Passage") + ylab("Proportion") + 
+  scale_y_continuous(breaks=seq(0,1,.10))
+
+p3
+rm(p3)
+```
+
+----
+TABLE GENERATION
+
+
+Supplementary Table 3
+```{r}
+TableS3 <- data.frame(CFS414$passage, CFS414$integrated_snn_res.0.3,
+                      CFS414$Phase,CFS414$nCount_RNA, CFS414$nFeature_RNA)
+
+```
+
+
+Supplementary Table 4
+```{r}
+
+DefaultAssay(CFS414)<-"RNA"
+
+# Generate unscaled gene expression data for Table S4
+  Dot24<-DotPlot(subset(CFS414,subset=passage=="P24"),
+                 features=rownames(CFS414),
+                 group.by = "passage")
+   cfs24_exp<-Dot24$data
+   cfs24_exp<-cfs24_exp[order(rownames(cfs24_exp)),]
+    
+  Dot50<-DotPlot(subset(CFS414,subset=passage=="P50"),
+                 features=rownames(CFS414),
+                 group.by = "passage")
+   cfs50_exp<-Dot50$data
+   cfs50_exp<-cfs50_exp[order(rownames(cfs50_exp)),]
+   
+  Dot414<-DotPlot(CFS414,features=rownames(CFS414),group.by = "all")
+   cfs414_exp<-Dot414$data
+   cfs414_exp<-cfs414_exp[order(rownames(cfs414_exp)),]
+
+ 
+ allgenes_bypass<-FindMarkers(CFS414,logfc.threshold = -Inf,min.pct = -Inf,
+                              ident.1 = "P24",ident.2 = "P50", 
+                              group.by="passage",min.cells.feature = -Inf)
+ allgenes_bypass<-allgenes_bypass[order(rownames(allgenes_bypass)),]
+
+# Load and process Genelists
+ 
+  # subset of genes from https://hpo.jax.org/app/download/annotation
+  HPO_list<-read.csv("/Reference_files/Speech_HPO_2021v2.csv")
+  speech_Dot<-DotPlot(CFS414, features=unique(HPO_list$Gene), 
+                      group.by = "all")$data
+  speech_Dot<-speech_Dot[order(rownames(speech_Dot)),]
+ 
+  #from https://pubmed.ncbi.nlm.nih.gov/28680683/
+  WNV_genes<-read.csv("/Reference_files/Newhouse_WNV_genes.csv")
+  WNV_Dot<-DotPlot(CFS414, features=WNV_genes$GeneName, 
+                   group.by = "all")$data
+  WNV_Dot<-WNV_Dot[order(rownames(WNV_Dot)),]
+ 
+  #from https://pubmed.ncbi.nlm.nih.gov/29103391/
+  AvianFlu_genes<-c("VTCN1","TNFRSF1A","TMEM39A","GSK3B","RFTN1",
+                   "PLCL2","SATB1","NFKBIA","WWOX","MAP2K6",
+                   "SOX9","NLRX1","CRTAM","THY1","FBN3",
+                   "SPPL2B","ANXA1","PCSK5","ABCA1","KLF4","LOC100228379") 
+ 
+ AvianFlu_Dot<-DotPlot(CFS414, features=AvianFlu_genes , group.by = "all")$data
+ AvianFlu_Dot<-AvianFlu_Dot[order(rownames(AvianFlu_Dot)),]
+
+rm(Dot24,Dot50,Dot414)
+
+# Generate genelist from Gedman, in prep list
+ VL_DEGs<-read.csv(file="/Reference_files/VLDEG_List_simplified.csv")
+ Mixed_DEGs<-subset(VL_DEGs, VL_DEG %in% "BOTH")$Gene
+ upreg_DEGs<-c(subset(VL_DEGs, VL_DEG %in% "UP")$Gene,Mixed_DEGs)
+ dnreg_DEGs<-c(subset(VL_DEGs, VL_DEG %in% "DOWN")$Gene,Mixed_DEGs)
+ 
+ 
+ RA_dn<-subset(VL_DEGs, RA %in% "-1")$Gene
+ RA_up<-subset(VL_DEGs, RA %in% "1")$Gene
+ HVC_dn<-subset(VL_DEGs, HVC %in% "-1")$Gene
+ HVC_up<-subset(VL_DEGs, HVC %in% "1")$Gene
+ LMAN_dn<-subset(VL_DEGs, LMAN %in% "-1")$Gene
+ LMAN_up<-subset(VL_DEGs, LMAN %in% "1")$Gene
+ AX_dn<-subset(VL_DEGs, AX %in% "-1")$Gene
+ AX_up<-subset(VL_DEGs, AX %in% "1")$Gene
+
+ upreg_DEGs<-unique(c(RA_up,HVC_up,LMAN_up,AX_up))
+ dnreg_DEGs<-unique(c(RA_dn,HVC_dn,LMAN_dn,AX_dn))
+ All_DEGs<-unique(union(upreg_DEGs,dnreg_DEGs))
+ Mixed_DEGs<-intersect(upreg_DEGs,dnreg_DEGs)
+ upreg_DEGs<-setdiff(upreg_DEGs,Mixed_DEGs)
+ dnreg_DEGs<-setdiff(dnreg_DEGs,Mixed_DEGs)
+
+ rm(RA_dn,RA_up,HVC_dn,HVC_up,LMAN_dn,LMAN_up,AX_dn,AX_up,VL_DEGs)
+
+# Build table
+ TableS4<-c()
+ TableS4<-data.frame(rownames(CFS414))
+ 
+ TableS4$Gene_name<-TableS4$rownames.CFS414.
+ TableS4<-TableS4[order(TableS4$Gene_name),]
+ TableS4<-subset(TableS4,select=Gene_name)
+
+
+# Generate Columns for gene lists
+
+# HPO speech genes
+Genelist<-c()
+
+n<-0
+count <- c(1:length(TableS4[,1]))
+for(val in count)
+{
+n<-n+1
+ if(length(intersect(TableS4$Gene_name[n],HPO_list$Gene))>0) {
+   Genelist<-c(Genelist,subset(HPO_list,subset=Gene==TableS4[n,1])[,4]) 
+ }
+ else(Genelist<-c(Genelist,FALSE))
+}
+HPO_speech_Gene<-Genelist
+
+
+#Newhouse 2017
+Genelist<-c()
+n<-0
+count <- c(1:length(TableS4[,1]))
+for(val in count)
+{
+n<-n+1
+ if(length(intersect(TableS4[n,1],rownames(WNV_Dot)))>0) {
+   Genelist<-c(Genelist,TRUE) 
+ }
+ else(Genelist<-c(Genelist,FALSE))
+}
+WNV_Gene<-Genelist
+
+
+# Avian Flu
+Genelist<-c()
+n<-0
+count <- c(1:length(TableS4[,1]))
+for(val in count)
+{
+n<-n+1
+ if(length(intersect(TableS4[n,1],rownames(AvianFlu_Dot)))>0) {
+   Genelist<-c(Genelist,TRUE) 
+ }
+ else(Genelist<-c(Genelist,FALSE))
+}
+AvianFlu_Gene<-Genelist
+
+
+# Gedman VL DEG list
+Genelist<-c()
+n<-0
+count <- c(1:length(TableS4[,1]))
+for(val in count)
+{
+n<-n+1
+ if(length(intersect(TableS4[n,1],upreg_DEGs))>0) {
+   Genelist<-c(Genelist,"UP") 
+ }
+else if(length(intersect(TableS4[n,1],dnreg_DEGs))>0) {
+   Genelist<-c(Genelist,"DOWN") 
+}
+else if(length(intersect(TableS4[n,1],Mixed_DEGs))>0) {
+   Genelist<-c(Genelist,"BOTH") 
+ }
+ else(Genelist<-c(Genelist,FALSE))
+}
+VLDEG_Gene<-Genelist
+
+
+# Order standardized variance values
+VG_P24<-VG_P24[order(rownames(VG_P24)),]
+VG_P50<-VG_P50[order(rownames(VG_P50)),]
+
+# Combine the columns into the table
+TableS4<-c()
+TableS4<-data.frame(rownames(CFS414))
+TableS4$Gene_name<-TableS4$rownames.CFS414.
+TableS4<-TableS4[order(TableS4$Gene_name),]
+TableS4<-subset(TableS4,select=Gene_name)
+
+TableS4$P24_avg.exp<-cfs24_exp$avg.exp
+TableS4$P24_pct.exp<-cfs24_exp$pct.exp
+TableS4$P24_variance.standardized<-CFS24_vg$variance.standardized
+ 
+TableS4$P50_avg.exp<-cfs50_exp$avg.exp
+TableS4$P50_pct.exp<-cfs50_exp$pct.exp
+TableS4$P50_variance.standardized<-CFS50_vg$variance.standardized
+
+TableS4$Combined_avg.exp<-cfs414_exp$avg.exp
+TableS4$Combined_pct.exp<-cfs414_exp$pct.exp
+
+#order gene names
+allgenes_bypass<-allgenes_bypass[order(rownames(allgenes_bypass)),]
+
+TableS4$P24_P50_avg.LogFC<-allgenes_bypass$avg_logFC
+TableS4$LogFC_p_val<-allgenes_bypass$p_val
+TableS4$LogFC_p_val_adj<-allgenes_bypass$p_val_adj
+
+# Add genelists columns
+ TableS4$VL_DEG<-VLDEG_Gene
+ TableS4$WNV_Newhouse2017<-WNV_Gene
+ TableS4$AvianInfluenza_DrobikCzwarno2018<-AvianFlu_Gene
+ TableS4$HPO<-HPO_speech_Gene 
+ 
+ 
+```
+
+Supplementary Table 5
+```{r}
+# All markers for each cluster in passage 24
+TableS5 <- FindAllMarkers(subset(CFS414,subset=passage=="P24"), 
+                          logfc.threshold = -Inf, min.pct = -Inf, 
+                          min.diff.pct = -Inf, only.pos = FALSE)
+```
+
